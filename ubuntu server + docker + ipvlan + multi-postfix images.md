@@ -1,881 +1,560 @@
-# ubuntu server + docker + ipvlan + multi-postfix images
+# ubuntu server + postfix + postmulti + OpenDKIM + TLS
 
-這邊記錄一下設定記錄：
+目的：在一台 ubuntu server 服務器上使用多個虛擬 IP 並服務多個 postfix multi-instances，形成在一台服務器上，有多個且獨立的 smtp 分別寄送郵件。
 
-新增兩組虛擬 IP：10.1.11.41 與 10.1.11.42 
+:::info
+在此預設你會：
+- CCNA 相關知識。
+    - 熟悉防火牆設定。
+    - 熟悉 Core Switch 設定。
+    - 熟悉 TCP/IP OSI 7 layer。
+- Esxi vCenter 設定。
+:::
 
-```shell=
-postfix@testpostfix:~$ sudo cat /etc/netplan/00-installer-config.yaml
-[sudo] password for postfix:
+### 以下開始看 shell 命令並稍加說明：
+```shell
+❯ ssh -i .ssh/id_rsa_for_smtp victor-postfix@10.1.11.43
+Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-91-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+  System information as of Thu Feb  1 10:17:51 AM CST 2024
+
+  System load:  0.0                Processes:               152
+  Usage of /:   40.5% of 14.66GB   Users logged in:         0
+  Memory usage: 6%                 IPv4 address for ens160: 10.1.11.43
+  Swap usage:   0%                 IPv4 address for ens160: 10.1.11.45
+
+
+Expanded Security Maintenance for Applications is not enabled.
+
+47 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+
+Enable ESM Apps to receive additional future security updates.
+See https://ubuntu.com/esm or run: sudo pro status
+
+
+The list of available updates is more than a week old.
+To check for new updates run: sudo apt update
+Failed to connect to https://changelogs.ubuntu.com/meta-release-lts. Check your Internet connection or proxy settings
+
+
+Last login: Wed Jan 31 14:33:20 2024 from 10.0.8.245
+```
+已在 esxi 上安裝 Ubuntu 22.04.3 LTS，並且 mapping 多個內部 IP，如果需要看網路設定，請參閱詳細資訊，在此就不贅述。
+
+:::spoiler
+```shell
+victor-postfix@victorpostfix:~$ cat /etc/netplan/00-installer-config.yaml
 # This is the network config written by 'subiquity'
 network:
   ethernets:
     ens160:
       addresses:
-        - 10.1.11.40/24
-        - 10.1.11.41/24
-        - 10.1.11.42/24
+      - 10.1.11.43/24
+      - 10.1.11.45/24
       nameservers:
         addresses:
-          - 8.8.8.8
+        - 10.1.0.72
+        - 10.1.0.73
         search: []
       routes:
       - to: default
         via: 10.1.11.254
   version: 2
 ```
+設定完畢後記得要讓其生效：
+```shell
+sudo netplan apply
+```
 
-新增 ipvlan 給 docker 使用：
+:::
+
+### 驗證網路配置
 
 ```shell
-sudo docker network create -d ipvlan   --subnet=10.1.11.0/24   --gateway=10.1.11.254   -o ipvlan_mode=l2   -o parent=ens160   my_ipvlan_network
+victor-postfix@victorpostfix:~$ ip addr show ens160
+2: ens160: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 00:50:56:a5:c5:e6 brd ff:ff:ff:ff:ff:ff
+    altname enp3s0
+    inet 10.1.11.43/24 brd 10.1.11.255 scope global ens160
+       valid_lft forever preferred_lft forever
+    inet 10.1.11.45/24 brd 10.1.11.255 scope global secondary ens160
+       valid_lft forever preferred_lft forever
+    inet6 fe80::250:56ff:fea5:c5e6/64 scope link
+       valid_lft forever preferred_lft forever
 ```
 
-確認一下：
+### 安裝 Postfix
+
+```shell
+sudo apt-get update
+```
+更新套件庫。
+
+```shell
+sudo apt-get install postfix
+```
+安裝 postfix
+
+### 安裝 OpenDKIM
+
+```shell
+sudo apt-get install opendkim opendkim-tools
+```
+
+### 設置啟用 Postmulti
+
+```shell
+sudo nano /etc/postfix/main.cf
+
+mynetworks_style = subnet
+mynetworks = 10.0.0.0/16, 10.1.0.0/16
+
+mailbox_size_limit = 0
+recipient_delimiter = +
+inet_interfaces = localhost
+inet_protocols = all
+
+multi_instance_enable = yes
+multi_instance_wrapper = ${command_directory}/postmulti -p --
+
+debug_peer_level = 2
+```
+主要是添加這一行
+
+:::warning
+==**multi_instance_enable = yes**==
+:::
+
+
+
+### 初始化 Postmulti
+
+```shell
+sudo postmulti -e init
+```
+
+### 為每個 IP 建立 postfix instance
 
 ```shell=
-postfix@testpostfix:~$ sudo docker network ls
-NETWORK ID     NAME                DRIVER    SCOPE
-210bee15d171   bridge              bridge    local
-95a1d897ef1d   host                host      local
-1afb7ea28cb4   my_ipvlan_network   ipvlan    local
-884ced2539e7   none                null      local
+sudo postmulti -I postfix-43 -e create
+sudo postmulti -I postfix-45 -e create
 ```
+每個 postfix instance 都會有自己的配置文件，位於 /etc/postfix-(instance_number)
 
-docker image list
+### 編輯 postfix-43/main.cf 與 postfix-45/main.cf
+
+主要是添加以下幾行：
+#### postfix-43/main.cf
+:::warning
+==**multi_instance_name = postfix-43**==
+
+==**multi_instance_group = mail**==
+
+==**inet_interfaces = 10.1.11.43**==
+
+==**multi_instance_enable = yes**==
+:::
+#### postfix-45/main.cf
+:::warning
+==**multi_instance_name = postfix-45**==
+
+==**multi_instance_group = mail**==
+
+==**inet_interfaces = 10.1.11.45**==
+
+==**multi_instance_enable = yes**==
+:::
+
+### 重新啟動 postfix instances
 
 ```shell=
-postfix@testpostfix:~$ sudo docker image ls
-REPOSITORY          TAG       IMAGE ID       CREATED        SIZE
-postfix-with-nano   latest    2c46959bea3a   2 weeks ago    265MB
-boky/postfix        latest    96c3f55740bf   3 weeks ago    231MB
-hello-world         latest    d2c94e258dcb   9 months ago   13.3kB
+sudo postmulti -i postfix-43 -p restart
+sudo postmulti -i postfix-45 -p restart
 ```
 
-docker run 吧！
+### 檢查 postfix instances status
 
 ```shell=
-sudo docker run -d --name postfix-41 --network my_ipvlan_network --ip 10.1.11.41 postfix-with-nano
-
-sudo docker run -d --name postfix-42 --network my_ipvlan_network --ip 10.1.11.42 postfix-with-nano
+sudo postmulti -i postfix-43 -p status
+sudo postmulti -i postfix-45 -p status
 ```
 
-檢查一下 docker network inspect
+### 檢查 instances 狀態
 
 ```shell=
-postfix@testpostfix:~$ sudo docker network inspect my_ipvlan_network
-[
-    {
-        "Name": "my_ipvlan_network",
-        "Id": "1afb7ea28cb4a27f3176733dcfc4277cde7c0e727116b845648d8c5b817b9a9e",
-        "Created": "2024-01-31T07:10:04.838777596Z",
-        "Scope": "local",
-        "Driver": "ipvlan",
-        "EnableIPv6": false,
-        "IPAM": {
-            "Driver": "default",
-            "Options": {},
-            "Config": [
-                {
-                    "Subnet": "10.1.11.0/24",
-                    "Gateway": "10.1.11.254"
-                }
-            ]
-        },
-        "Internal": false,
-        "Attachable": false,
-        "Ingress": false,
-        "ConfigFrom": {
-            "Network": ""
-        },
-        "ConfigOnly": false,
-        "Containers": {
-            "9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24": {
-                "Name": "postfix-42",
-                "EndpointID": "20ed5eb5eb65703ab427a46c49ac6469769bf75fe1da5f02c4bbb4e24300fe62",
-                "MacAddress": "",
-                "IPv4Address": "10.1.11.42/24",
-                "IPv6Address": ""
-            },
-            "a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4": {
-                "Name": "postfix-41",
-                "EndpointID": "30ceba1d778a436d03f8c39861072d4c635967a5046b0d6ca85fc46da6812d94",
-                "MacAddress": "",
-                "IPv4Address": "10.1.11.41/24",
-                "IPv6Address": ""
-            }
-        },
-        "Options": {
-            "ipvlan_mode": "l2",
-            "parent": "ens160"
-        },
-        "Labels": {}
-    }
-]
+victor-postfix@victorpostfix:~$ sudo postmulti -l
+-               -               y         /etc/postfix
+postfix-43      mail            n         /etc/postfix-43
+postfix-45      mail            n         /etc/postfix-45
+postfix-46      -               n         /etc/postfix-46
 ```
+這裡的設定已經是啟用了自動啟動功能，所以看到 y 的參數，沒啟用的是顯示 n 的參數。
+而 postfix-43 mail 的意思是指 postfix-43 與 postfix-45 都在 mail 的 Group 裡頭！
+
+### 讓 postfix instances 啟用自動啟動功能
+
+```shell=
+sudo postmulti -i postfix-43 -e enable
+sudo postmulti -i postfix-45 -e enable
+```
+```shell=
+victor-postfix@victorpostfix:~$ sudo postmulti -l
+-               -               y         /etc/postfix
+postfix-43      mail            y         /etc/postfix-43
+postfix-45      mail            y         /etc/postfix-45
+postfix-46      -               n         /etc/postfix-46
+```
+
+### ==Group 查詢==
+
+```shell=
+victor-postfix@victorpostfix:~$ sudo postmulti -g mail -p status
+postfix-43/postfix-script: the Postfix mail system is running: PID: 1584
+postfix-45/postfix-script: the Postfix mail system is running: PID: 1585
+```
+
+### 測試
+
+```shell
+ telnet 10.1.11.43 25
+Trying 10.1.11.43...
+Connected to 10.1.11.43.
+Escape character is '^]'.
+220 s43.11.ecrm.com.tw ESMTP Postfix (Ubuntu)
+^C
+quit
+
+telnet 10.1.11.45 25
+Trying 10.1.11.45...
+Connected to 10.1.11.45.
+Escape character is '^]'.
+220 s45.11.ecrm.com.tw ESMTP Postfix (Ubuntu)
+quit
+221 2.0.0 Bye
+```
+測試成功。
+
+
+## OpenDKIM
+### 安裝 Opendkim
+
+```shell
+sudo apt-get update
+sudo apt-get install opendkim opendkim-tools
+```
+
+### 設定 Opendkim
+
+```shell
+sudo nano /etc/opendkim.conf
+
+KeyFile /etc/opendkim/keys/default.private
+Selector default
+KeyTable /etc/opendkim/KeyTable
+SigningTable /etc/opendkim/SigningTable
+Socket  inet:8891@localhost
+InternalHosts  10.1.0.0/16, 10.0.0.0/16
+```
+
+### 建立加解密鑰的目錄
+
+```shell
+sudo mkdir -p /etc/opendkim/keys
+```
+
+### 在每個 postfix instances main.cf 加上：
+
+```shell
+#DKIM Parameters
+smtpd_milters           = inet:127.0.0.1:8891
+non_smtpd_milters       = $smtpd_milters
+milter_default_action   = accept
+milter_protocol         = 2
+```
+參數說明：
+:::spoiler
+- smtpd_milters = inet:127.0.0.1:8891：
+    - 這個設定是告訴 Postfix 的 SMTP 服務要連接到哪個郵件過濾器（milter）。這裡設定為在本機（127.0.0.1）的 8891 端口。
+    - 通常這個過濾器是用來進行 DKIM 簽名或其他類型的郵件處理。
+    - 就是說，Postfix 會把所有要發送的郵件先送到這個端口的服務處理，比如加上 DKIM 數位簽名。
+- non_smtpd_milters = $smtpd_milters：
+    - 這個設定是用來指定非 SMTP 進程（例如本地郵件投遞或郵件隊列處理）使用的 milter 服務。
+    - 設定為 $smtpd_milters，這表示非 SMTP 進程會使用跟 SMTP 進程相同的 milter 設定，確保所有的郵件處理都一致。
+- milter_default_action = accept：
+    - 這個設定定義了當無法連接到 milter 服務或服務出錯時，Postfix 應該怎麼辦。
+    - 設定為 accept，意味著即使 milter 服務無回應或出錯，Postfix 還是會接受並處理郵件。這樣可以確保在 milter 服務有問題時，不會錯過或拒絕合法郵件。
+- milter_protocol = 2：
+    - 這個設定指的是 Postfix 跟 milter 之間通訊所用的協定版本。
+    - 2 代表使用 milter 協定的第二版本，這是一個支援較新功能的版本，大部分現代的 milter 應用都兼容這個版本。
+
+這些設定通常用於配置 DKIM（一種郵件驗證機制）或用於檢查郵件內容的其他過濾器。透過這些設定，Postfix 能夠在發送郵件過程中添加數字簽名，或進行其他形式的郵件處理。
+:::
+
+之後要重啟 instances 
+```shell
+sudo postmulti -g mail -p restart
+```
+
+### 重啟 Opendkim
+
+```shell
+sudo systemctl restart opendkim
+```
+
+### 查看詳細日誌
+
+```shell
+journalctl -xeu opendkim.service
+```
+
+```shell
+victor-postfix@victorpostfix:~$ journalctl -xeu opendkim.service
+░░ Subject: Automatic restarting of a unit has been scheduled
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ Automatic restarting of the unit opendkim.service has been scheduled, as the result for
+░░ the configured Restart= setting for the unit.
+Jan 08 08:46:42 victorpostfix systemd[1]: Stopped OpenDKIM Milter.
+░░ Subject: A stop job for unit opendkim.service has finished
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ A stop job for unit opendkim.service has finished.
+░░
+░░ The job identifier is 6380 and the job result is done.
+Jan 08 08:46:42 victorpostfix systemd[1]: opendkim.service: Start request repeated too quickly.
+Jan 08 08:46:42 victorpostfix systemd[1]: opendkim.service: Failed with result 'exit-code'.
+░░ Subject: Unit failed
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ The unit opendkim.service has entered the 'failed' state with result 'exit-code'.
+Jan 08 08:46:42 victorpostfix systemd[1]: Failed to start OpenDKIM Milter.
+░░ Subject: A start job for unit opendkim.service has failed
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ A start job for unit opendkim.service has finished with a failure.
+░░
+░░ The job identifier is 6380 and the job result is failed.
+```
+
+### 錯誤排解-1 ～
+
+#### 建立與設置 KeyTable 和 SigningTable
+
+```shell
+sudo touch /etc/opendkim/KeyTable
+sudo touch /etc/opendkim/SigningTable
+```
+#### 權限設置
+
+```shell
+sudo chown opendkim:opendkim /etc/opendkim/KeyTable
+sudo chown opendkim:opendkim /etc/opendkim/SigningTable
+sudo chmod 640 /etc/opendkim/KeyTable
+sudo chmod 640 /etc/opendkim/SigningTable
+```
+
+#### 重啟 opendkim
+
+```shell
+sudo systemctl restart opendkim
+```
+
+再次檢查
+
+```shell
+victor-postfix@victorpostfix:/etc$ journalctl -xeu opendkim.service
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ The unit opendkim.service has successfully entered the 'dead' state.
+Jan 08 09:18:19 victorpostfix systemd[1]: Stopped OpenDKIM Milter.
+░░ Subject: A stop job for unit opendkim.service has finished
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ A stop job for unit opendkim.service has finished.
+░░
+░░ The job identifier is 6552 and the job result is done.
+Jan 08 09:18:19 victorpostfix systemd[1]: Starting OpenDKIM Milter...
+░░ Subject: A start job for unit opendkim.service has begun execution
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ A start job for unit opendkim.service has begun execution.
+░░
+░░ The job identifier is 6552.
+Jan 08 09:18:19 victorpostfix systemd[1]: opendkim.service: Can't open PID file /run/opendkim/opendkim.pid (yet?) after start: Operation not permitted
+Jan 08 09:18:19 victorpostfix systemd[1]: Started OpenDKIM Milter.
+░░ Subject: A start job for unit opendkim.service has finished successfully
+░░ Defined-By: systemd
+░░ Support: http://www.ubuntu.com/support
+░░
+░░ A start job for unit opendkim.service has finished successfully.
+░░
+░░ The job identifier is 6552.
+Jan 08 09:18:19 victorpostfix opendkim[16851]: OpenDKIM Filter v2.11.0 starting
+```
+
+### 錯誤排解-2 ～
+
+```shell
+victor-postfix@victorpostfix:~$ cat /lib/systemd/system/opendkim.service
+[Unit]
+Description=OpenDKIM Milter
+Documentation=man:opendkim(8) man:opendkim.conf(5) man:opendkim-lua(3) man:opendkim-genkey(8) man:opendkim-genzone(8) man:opendkim-testkey(8) http://www.opendkim.org/docs.html
+After=network.target nss-lookup.target
+
+[Service]
+Type=forking
+#PIDFile=/run/opendkim/opendkim.pid
+ExecStart=/usr/sbin/opendkim
+ExecReload=/bin/kill -USR1 $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+:::danger
+請將這一行註解掉...
+
+#PIDFile=/run/opendkim/opendkim.pid
+
+同樣的在 /etc/opendkim.conf 裡的設定一樣要註解掉
+
+#PidFile			/run/opendkim/opendkim.pid
+:::
+
+最後 ..... 終於 .....
+
+```shell
+victor-postfix@victorpostfix:/etc$ sudo systemctl status opendkim
+● opendkim.service - OpenDKIM Milter
+     Loaded: loaded (/lib/systemd/system/opendkim.service; enabled; vendor preset: enabled)
+     Active: active (running) since Mon 2024-01-08 18:14:44 CST; 13s ago
+       Docs: man:opendkim(8)
+             man:opendkim.conf(5)
+             man:opendkim-lua(3)
+             man:opendkim-genkey(8)
+             man:opendkim-genzone(8)
+             man:opendkim-testkey(8)
+             http://www.opendkim.org/docs.html
+    Process: 17356 ExecStart=/usr/sbin/opendkim (code=exited, status=0/SUCCESS)
+   Main PID: 17357 (opendkim)
+      Tasks: 6 (limit: 4558)
+     Memory: 1.9M
+        CPU: 24ms
+     CGroup: /system.slice/opendkim.service
+             └─17357 /usr/sbin/opendkim
+
+Jan 08 18:14:44 victorpostfix systemd[1]: Stopped OpenDKIM Milter.
+Jan 08 18:14:44 victorpostfix systemd[1]: Starting OpenDKIM Milter...
+Jan 08 18:14:44 victorpostfix systemd[1]: Started OpenDKIM Milter.
+Jan 08 18:14:44 victorpostfix opendkim[17357]: OpenDKIM Filter v2.11.0 starting
+```
+
+## 設置 TLS
 
 :::info
-檢查 docker inspect postfix-41
-
-但因為資料頗多，所以請進入詳細資訊察看唷！
-:::
-:::spoiler
-```shell=
-postfix@testpostfix:~$ sudo docker inspect postfix-41
-[
-    {
-        "Id": "a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4",
-        "Created": "2024-01-31T07:12:33.807732199Z",
-        "Path": "/bin/sh",
-        "Args": [
-            "-c",
-            "/scripts/run.sh"
-        ],
-        "State": {
-            "Status": "running",
-            "Running": true,
-            "Paused": false,
-            "Restarting": false,
-            "OOMKilled": false,
-            "Dead": false,
-            "Pid": 6246,
-            "ExitCode": 0,
-            "Error": "",
-            "StartedAt": "2024-01-31T07:12:34.436544421Z",
-            "FinishedAt": "0001-01-01T00:00:00Z",
-            "Health": {
-                "Status": "healthy",
-                "FailingStreak": 0,
-                "Log": [
-                    {
-                        "Start": "2024-01-31T08:33:34.266873086Z",
-                        "End": "2024-01-31T08:33:36.470178968Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:34:06.47802743Z",
-                        "End": "2024-01-31T08:34:08.663768321Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:34:38.670854477Z",
-                        "End": "2024-01-31T08:34:40.86043903Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:35:10.867525338Z",
-                        "End": "2024-01-31T08:35:13.072293924Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:35:43.080300317Z",
-                        "End": "2024-01-31T08:35:45.269648162Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    }
-                ]
-            }
-        },
-        "Image": "sha256:2c46959bea3a9c85f7a21e96460dc8c16ca3bc05ff2b0d3e08d781e9b96076b0",
-        "ResolvConfPath": "/var/lib/docker/containers/a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4/resolv.conf",
-        "HostnamePath": "/var/lib/docker/containers/a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4/hostname",
-        "HostsPath": "/var/lib/docker/containers/a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4/hosts",
-        "LogPath": "/var/lib/docker/containers/a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4/a4b34c08b51b7f5d9db03729672b46f2efbd9056588ed03cac7561e86b472dd4-json.log",
-        "Name": "/postfix-41",
-        "RestartCount": 0,
-        "Driver": "overlay2",
-        "Platform": "linux",
-        "MountLabel": "",
-        "ProcessLabel": "",
-        "AppArmorProfile": "docker-default",
-        "ExecIDs": [
-            "88b380562270af6f7497cbea5bf4fea38338c7c99a30aa5421e9dea405b2a6d5"
-        ],
-        "HostConfig": {
-            "Binds": null,
-            "ContainerIDFile": "",
-            "LogConfig": {
-                "Type": "json-file",
-                "Config": {}
-            },
-            "NetworkMode": "my_ipvlan_network",
-            "PortBindings": {},
-            "RestartPolicy": {
-                "Name": "no",
-                "MaximumRetryCount": 0
-            },
-            "AutoRemove": false,
-            "VolumeDriver": "",
-            "VolumesFrom": null,
-            "ConsoleSize": [
-                30,
-                150
-            ],
-            "CapAdd": null,
-            "CapDrop": null,
-            "CgroupnsMode": "private",
-            "Dns": [],
-            "DnsOptions": [],
-            "DnsSearch": [],
-            "ExtraHosts": null,
-            "GroupAdd": null,
-            "IpcMode": "private",
-            "Cgroup": "",
-            "Links": null,
-            "OomScoreAdj": 0,
-            "PidMode": "",
-            "Privileged": false,
-            "PublishAllPorts": false,
-            "ReadonlyRootfs": false,
-            "SecurityOpt": null,
-            "UTSMode": "",
-            "UsernsMode": "",
-            "ShmSize": 67108864,
-            "Runtime": "runc",
-            "Isolation": "",
-            "CpuShares": 0,
-            "Memory": 0,
-            "NanoCpus": 0,
-            "CgroupParent": "",
-            "BlkioWeight": 0,
-            "BlkioWeightDevice": [],
-            "BlkioDeviceReadBps": [],
-            "BlkioDeviceWriteBps": [],
-            "BlkioDeviceReadIOps": [],
-            "BlkioDeviceWriteIOps": [],
-            "CpuPeriod": 0,
-            "CpuQuota": 0,
-            "CpuRealtimePeriod": 0,
-            "CpuRealtimeRuntime": 0,
-            "CpusetCpus": "",
-            "CpusetMems": "",
-            "Devices": [],
-            "DeviceCgroupRules": null,
-            "DeviceRequests": null,
-            "MemoryReservation": 0,
-            "MemorySwap": 0,
-            "MemorySwappiness": null,
-            "OomKillDisable": null,
-            "PidsLimit": null,
-            "Ulimits": null,
-            "CpuCount": 0,
-            "CpuPercent": 0,
-            "IOMaximumIOps": 0,
-            "IOMaximumBandwidth": 0,
-            "MaskedPaths": [
-                "/proc/asound",
-                "/proc/acpi",
-                "/proc/kcore",
-                "/proc/keys",
-                "/proc/latency_stats",
-                "/proc/timer_list",
-                "/proc/timer_stats",
-                "/proc/sched_debug",
-                "/proc/scsi",
-                "/sys/firmware",
-                "/sys/devices/virtual/powercap"
-            ],
-            "ReadonlyPaths": [
-                "/proc/bus",
-                "/proc/fs",
-                "/proc/irq",
-                "/proc/sys",
-                "/proc/sysrq-trigger"
-            ]
-        },
-        "GraphDriver": {
-            "Data": {
-                "LowerDir": "/var/lib/docker/overlay2/76946cbcce99a58e88f585d5b1ca2793e99e522f31c03db064db2b3a0f260dfd-init/diff:/var/lib/docker/overlay2/d07c2fa903e074b6d7135f0ab43ae1f42d0a7e266a1385acce76c9dc83be3dea/diff:/var/lib/docker/overlay2/9060bfc6830e4e5e3a5213cd6f0573dddced0ff68ab652520e2ff8e43ae75dff/diff:/var/lib/docker/overlay2/b1f9cc3b11e1792673981ecdd1b5455d82888820bae30d6c2d97230643399e0a/diff:/var/lib/docker/overlay2/6082ed8183a4bf0eff85857e7c8574af5556c582c55b1ca082251cc4b853696f/diff:/var/lib/docker/overlay2/71546895a548d653778ac8e7e8d06e43bbf2b3388730d8def7b6eb82dc92d8c1/diff:/var/lib/docker/overlay2/36efb30976fc98dc5414969d9a1829e8afa8ef89bd6334348ec62904e5a74fa3/diff:/var/lib/docker/overlay2/229d9381673cf269067fcdcb1416cf6dfb07f2ec692f67ff1e6b8818bc85b2da/diff:/var/lib/docker/overlay2/a412ea4a467d1276277734dd69efa6c24437028b69d0572839c996d8d7ada279/diff:/var/lib/docker/overlay2/975008f36759e342f5628f68fb60d9ded9e448b50bfef14d7e16c981d6f180d4/diff:/var/lib/docker/overlay2/01d67e3ca13651add9e6a73a8466a6adfa44a68e5d717fbe49a7bfd4db715b65/diff:/var/lib/docker/overlay2/1df773259c8c2376c3915556a76a9f602420f898d9368379e6c38d9c8f994dbc/diff:/var/lib/docker/overlay2/03d0ba6bc5b67f4232211e1eae9c57d72dbfe6330b87922f2c806a9aedf96f05/diff:/var/lib/docker/overlay2/26f3b33e56960c4a8f9087a509503fb579a94d9662e37513a58c0c777266861a/diff",
-                "MergedDir": "/var/lib/docker/overlay2/76946cbcce99a58e88f585d5b1ca2793e99e522f31c03db064db2b3a0f260dfd/merged",
-                "UpperDir": "/var/lib/docker/overlay2/76946cbcce99a58e88f585d5b1ca2793e99e522f31c03db064db2b3a0f260dfd/diff",
-                "WorkDir": "/var/lib/docker/overlay2/76946cbcce99a58e88f585d5b1ca2793e99e522f31c03db064db2b3a0f260dfd/work"
-            },
-            "Name": "overlay2"
-        },
-        "Mounts": [
-            {
-                "Type": "volume",
-                "Name": "fb4562d31c6f3c25d56265d56b26b390e71d67bde5ce87bfcfc2b6f843baa909",
-                "Source": "/var/lib/docker/volumes/fb4562d31c6f3c25d56265d56b26b390e71d67bde5ce87bfcfc2b6f843baa909/_data",
-                "Destination": "/etc/postfix",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            },
-            {
-                "Type": "volume",
-                "Name": "1329a84a64539c7694361da23e2fb5608fe7328cd83993a6cf740767b1c904c0",
-                "Source": "/var/lib/docker/volumes/1329a84a64539c7694361da23e2fb5608fe7328cd83993a6cf740767b1c904c0/_data",
-                "Destination": "/var/spool/postfix",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            },
-            {
-                "Type": "volume",
-                "Name": "0f2e6430f2f2c6b2c4b3ba710ac4bda80cd86fe5e873aa00eb86404fae93ee56",
-                "Source": "/var/lib/docker/volumes/0f2e6430f2f2c6b2c4b3ba710ac4bda80cd86fe5e873aa00eb86404fae93ee56/_data",
-                "Destination": "/etc/opendkim/keys",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            }
-        ],
-        "Config": {
-            "Hostname": "a4b34c08b51b",
-            "Domainname": "",
-            "User": "root",
-            "AttachStdin": false,
-            "AttachStdout": false,
-            "AttachStderr": false,
-            "ExposedPorts": {
-                "25/tcp": {},
-                "587/tcp": {}
-            },
-            "Tty": false,
-            "OpenStdin": false,
-            "StdinOnce": false,
-            "Env": [
-                "ALLOW_EMPTY_SENDER_DOMAINS=true",
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            ],
-            "Cmd": [
-                "/bin/sh",
-                "-c",
-                "/scripts/run.sh"
-            ],
-            "Healthcheck": {
-                "Test": [
-                    "CMD-SHELL",
-                    "/scripts/healthcheck.sh"
-                ],
-                "Interval": 30000000000,
-                "Timeout": 5000000000,
-                "StartPeriod": 10000000000,
-                "Retries": 3
-            },
-            "Image": "postfix-with-nano",
-            "Volumes": {
-                "/etc/opendkim/keys": {},
-                "/etc/postfix": {},
-                "/var/spool/postfix": {}
-            },
-            "WorkingDir": "/tmp",
-            "Entrypoint": null,
-            "OnBuild": null,
-            "Labels": {
-                "maintainer": "Bojan Cekrlic - https://github.com/bokysan/docker-postfix/"
-            }
-        },
-        "NetworkSettings": {
-            "Bridge": "",
-            "SandboxID": "83d5b1aa24de928f05889b880dcb3f84003cae3318e3c050819f74856382cdbe",
-            "HairpinMode": false,
-            "LinkLocalIPv6Address": "",
-            "LinkLocalIPv6PrefixLen": 0,
-            "Ports": {},
-            "SandboxKey": "/var/run/docker/netns/83d5b1aa24de",
-            "SecondaryIPAddresses": null,
-            "SecondaryIPv6Addresses": null,
-            "EndpointID": "",
-            "Gateway": "",
-            "GlobalIPv6Address": "",
-            "GlobalIPv6PrefixLen": 0,
-            "IPAddress": "",
-            "IPPrefixLen": 0,
-            "IPv6Gateway": "",
-            "MacAddress": "",
-            "Networks": {
-                "my_ipvlan_network": {
-                    "IPAMConfig": {
-                        "IPv4Address": "10.1.11.41"
-                    },
-                    "Links": null,
-                    "Aliases": [
-                        "a4b34c08b51b"
-                    ],
-                    "NetworkID": "1afb7ea28cb4a27f3176733dcfc4277cde7c0e727116b845648d8c5b817b9a9e",
-                    "EndpointID": "30ceba1d778a436d03f8c39861072d4c635967a5046b0d6ca85fc46da6812d94",
-                    "Gateway": "10.1.11.254",
-                    "IPAddress": "10.1.11.41",
-                    "IPPrefixLen": 24,
-                    "IPv6Gateway": "",
-                    "GlobalIPv6Address": "",
-                    "GlobalIPv6PrefixLen": 0,
-                    "MacAddress": "",
-                    "DriverOpts": null
-                }
-            }
-        }
-    }
-]
-```
+由於設置就於簡單，原理與 SSL 觀念相同，所以直接貼上設置結果，重點處也會稍微說明。
 :::
 
-:::info
-檢查 docker inspect postfix-42
+### 修改 postfix instances master.cf
 
-但因為資料頗多，所以請進入詳細資訊察看唷！
-:::
-:::spoiler
-```shell=
-postfix@testpostfix:~$ sudo docker inspect postfix-42
-[
-    {
-        "Id": "9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24",
-        "Created": "2024-01-31T07:12:47.67018071Z",
-        "Path": "/bin/sh",
-        "Args": [
-            "-c",
-            "/scripts/run.sh"
-        ],
-        "State": {
-            "Status": "running",
-            "Running": true,
-            "Paused": false,
-            "Restarting": false,
-            "OOMKilled": false,
-            "Dead": false,
-            "Pid": 6758,
-            "ExitCode": 0,
-            "Error": "",
-            "StartedAt": "2024-01-31T07:12:48.294569751Z",
-            "FinishedAt": "0001-01-01T00:00:00Z",
-            "Health": {
-                "Status": "healthy",
-                "FailingStreak": 0,
-                "Log": [
-                    {
-                        "Start": "2024-01-31T08:37:01.092736502Z",
-                        "End": "2024-01-31T08:37:03.286081006Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:37:33.295664813Z",
-                        "End": "2024-01-31T08:37:35.476397105Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:38:05.481791838Z",
-                        "End": "2024-01-31T08:38:07.665621658Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:38:37.673258026Z",
-                        "End": "2024-01-31T08:38:39.845017225Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    },
-                    {
-                        "Start": "2024-01-31T08:39:09.851427724Z",
-                        "End": "2024-01-31T08:39:12.0492291Z",
-                        "ExitCode": 0,
-                        "Output": "Postfix check...\nDKIM check...\nAll OK!\n"
-                    }
-                ]
-            }
-        },
-        "Image": "sha256:2c46959bea3a9c85f7a21e96460dc8c16ca3bc05ff2b0d3e08d781e9b96076b0",
-        "ResolvConfPath": "/var/lib/docker/containers/9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24/resolv.conf",
-        "HostnamePath": "/var/lib/docker/containers/9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24/hostname",
-        "HostsPath": "/var/lib/docker/containers/9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24/hosts",
-        "LogPath": "/var/lib/docker/containers/9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24/9d9e72d885c1e5ca709355000aaca8c85ef58d8e94d00dafd6d0bb609ec5dc24-json.log",
-        "Name": "/postfix-42",
-        "RestartCount": 0,
-        "Driver": "overlay2",
-        "Platform": "linux",
-        "MountLabel": "",
-        "ProcessLabel": "",
-        "AppArmorProfile": "docker-default",
-        "ExecIDs": null,
-        "HostConfig": {
-            "Binds": null,
-            "ContainerIDFile": "",
-            "LogConfig": {
-                "Type": "json-file",
-                "Config": {}
-            },
-            "NetworkMode": "my_ipvlan_network",
-            "PortBindings": {},
-            "RestartPolicy": {
-                "Name": "no",
-                "MaximumRetryCount": 0
-            },
-            "AutoRemove": false,
-            "VolumeDriver": "",
-            "VolumesFrom": null,
-            "ConsoleSize": [
-                30,
-                150
-            ],
-            "CapAdd": null,
-            "CapDrop": null,
-            "CgroupnsMode": "private",
-            "Dns": [],
-            "DnsOptions": [],
-            "DnsSearch": [],
-            "ExtraHosts": null,
-            "GroupAdd": null,
-            "IpcMode": "private",
-            "Cgroup": "",
-            "Links": null,
-            "OomScoreAdj": 0,
-            "PidMode": "",
-            "Privileged": false,
-            "PublishAllPorts": false,
-            "ReadonlyRootfs": false,
-            "SecurityOpt": null,
-            "UTSMode": "",
-            "UsernsMode": "",
-            "ShmSize": 67108864,
-            "Runtime": "runc",
-            "Isolation": "",
-            "CpuShares": 0,
-            "Memory": 0,
-            "NanoCpus": 0,
-            "CgroupParent": "",
-            "BlkioWeight": 0,
-            "BlkioWeightDevice": [],
-            "BlkioDeviceReadBps": [],
-            "BlkioDeviceWriteBps": [],
-            "BlkioDeviceReadIOps": [],
-            "BlkioDeviceWriteIOps": [],
-            "CpuPeriod": 0,
-            "CpuQuota": 0,
-            "CpuRealtimePeriod": 0,
-            "CpuRealtimeRuntime": 0,
-            "CpusetCpus": "",
-            "CpusetMems": "",
-            "Devices": [],
-            "DeviceCgroupRules": null,
-            "DeviceRequests": null,
-            "MemoryReservation": 0,
-            "MemorySwap": 0,
-            "MemorySwappiness": null,
-            "OomKillDisable": null,
-            "PidsLimit": null,
-            "Ulimits": null,
-            "CpuCount": 0,
-            "CpuPercent": 0,
-            "IOMaximumIOps": 0,
-            "IOMaximumBandwidth": 0,
-            "MaskedPaths": [
-                "/proc/asound",
-                "/proc/acpi",
-                "/proc/kcore",
-                "/proc/keys",
-                "/proc/latency_stats",
-                "/proc/timer_list",
-                "/proc/timer_stats",
-                "/proc/sched_debug",
-                "/proc/scsi",
-                "/sys/firmware",
-                "/sys/devices/virtual/powercap"
-            ],
-            "ReadonlyPaths": [
-                "/proc/bus",
-                "/proc/fs",
-                "/proc/irq",
-                "/proc/sys",
-                "/proc/sysrq-trigger"
-            ]
-        },
-        "GraphDriver": {
-            "Data": {
-                "LowerDir": "/var/lib/docker/overlay2/22e9615c504fe25fe8e14905a17a6ae03b482671b74b622f89bae69bdb6cf58a-init/diff:/var/lib/docker/overlay2/d07c2fa903e074b6d7135f0ab43ae1f42d0a7e266a1385acce76c9dc83be3dea/diff:/var/lib/docker/overlay2/9060bfc6830e4e5e3a5213cd6f0573dddced0ff68ab652520e2ff8e43ae75dff/diff:/var/lib/docker/overlay2/b1f9cc3b11e1792673981ecdd1b5455d82888820bae30d6c2d97230643399e0a/diff:/var/lib/docker/overlay2/6082ed8183a4bf0eff85857e7c8574af5556c582c55b1ca082251cc4b853696f/diff:/var/lib/docker/overlay2/71546895a548d653778ac8e7e8d06e43bbf2b3388730d8def7b6eb82dc92d8c1/diff:/var/lib/docker/overlay2/36efb30976fc98dc5414969d9a1829e8afa8ef89bd6334348ec62904e5a74fa3/diff:/var/lib/docker/overlay2/229d9381673cf269067fcdcb1416cf6dfb07f2ec692f67ff1e6b8818bc85b2da/diff:/var/lib/docker/overlay2/a412ea4a467d1276277734dd69efa6c24437028b69d0572839c996d8d7ada279/diff:/var/lib/docker/overlay2/975008f36759e342f5628f68fb60d9ded9e448b50bfef14d7e16c981d6f180d4/diff:/var/lib/docker/overlay2/01d67e3ca13651add9e6a73a8466a6adfa44a68e5d717fbe49a7bfd4db715b65/diff:/var/lib/docker/overlay2/1df773259c8c2376c3915556a76a9f602420f898d9368379e6c38d9c8f994dbc/diff:/var/lib/docker/overlay2/03d0ba6bc5b67f4232211e1eae9c57d72dbfe6330b87922f2c806a9aedf96f05/diff:/var/lib/docker/overlay2/26f3b33e56960c4a8f9087a509503fb579a94d9662e37513a58c0c777266861a/diff",
-                "MergedDir": "/var/lib/docker/overlay2/22e9615c504fe25fe8e14905a17a6ae03b482671b74b622f89bae69bdb6cf58a/merged",
-                "UpperDir": "/var/lib/docker/overlay2/22e9615c504fe25fe8e14905a17a6ae03b482671b74b622f89bae69bdb6cf58a/diff",
-                "WorkDir": "/var/lib/docker/overlay2/22e9615c504fe25fe8e14905a17a6ae03b482671b74b622f89bae69bdb6cf58a/work"
-            },
-            "Name": "overlay2"
-        },
-        "Mounts": [
-            {
-                "Type": "volume",
-                "Name": "b5eaab2a271f6499bdb3d5f6e160e8a38d00f2b690d6179fbfeb9b93f76c8e92",
-                "Source": "/var/lib/docker/volumes/b5eaab2a271f6499bdb3d5f6e160e8a38d00f2b690d6179fbfeb9b93f76c8e92/_data",
-                "Destination": "/etc/opendkim/keys",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            },
-            {
-                "Type": "volume",
-                "Name": "0d2ac6cc18210e41a61ea5dd32a2bbf7dae51ceddcd2cb82b754879910326f3d",
-                "Source": "/var/lib/docker/volumes/0d2ac6cc18210e41a61ea5dd32a2bbf7dae51ceddcd2cb82b754879910326f3d/_data",
-                "Destination": "/etc/postfix",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            },
-            {
-                "Type": "volume",
-                "Name": "54032da9684dd5ec45b9243f7962596e1fb6817f8f9467421c3162ab8d224b75",
-                "Source": "/var/lib/docker/volumes/54032da9684dd5ec45b9243f7962596e1fb6817f8f9467421c3162ab8d224b75/_data",
-                "Destination": "/var/spool/postfix",
-                "Driver": "local",
-                "Mode": "",
-                "RW": true,
-                "Propagation": ""
-            }
-        ],
-        "Config": {
-            "Hostname": "9d9e72d885c1",
-            "Domainname": "",
-            "User": "root",
-            "AttachStdin": false,
-            "AttachStdout": false,
-            "AttachStderr": false,
-            "ExposedPorts": {
-                "25/tcp": {},
-                "587/tcp": {}
-            },
-            "Tty": false,
-            "OpenStdin": false,
-            "StdinOnce": false,
-            "Env": [
-                "ALLOW_EMPTY_SENDER_DOMAINS=true",
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            ],
-            "Cmd": [
-                "/bin/sh",
-                "-c",
-                "/scripts/run.sh"
-            ],
-            "Healthcheck": {
-                "Test": [
-                    "CMD-SHELL",
-                    "/scripts/healthcheck.sh"
-                ],
-                "Interval": 30000000000,
-                "Timeout": 5000000000,
-                "StartPeriod": 10000000000,
-                "Retries": 3
-            },
-            "Image": "postfix-with-nano",
-            "Volumes": {
-                "/etc/opendkim/keys": {},
-                "/etc/postfix": {},
-                "/var/spool/postfix": {}
-            },
-            "WorkingDir": "/tmp",
-            "Entrypoint": null,
-            "OnBuild": null,
-            "Labels": {
-                "maintainer": "Bojan Cekrlic - https://github.com/bokysan/docker-postfix/"
-            }
-        },
-        "NetworkSettings": {
-            "Bridge": "",
-            "SandboxID": "8df630dc332d8c53d5c8592630c6372cd525c0eccdbd71737e84d44c9596717c",
-            "HairpinMode": false,
-            "LinkLocalIPv6Address": "",
-            "LinkLocalIPv6PrefixLen": 0,
-            "Ports": {},
-            "SandboxKey": "/var/run/docker/netns/8df630dc332d",
-            "SecondaryIPAddresses": null,
-            "SecondaryIPv6Addresses": null,
-            "EndpointID": "",
-            "Gateway": "",
-            "GlobalIPv6Address": "",
-            "GlobalIPv6PrefixLen": 0,
-            "IPAddress": "",
-            "IPPrefixLen": 0,
-            "IPv6Gateway": "",
-            "MacAddress": "",
-            "Networks": {
-                "my_ipvlan_network": {
-                    "IPAMConfig": {
-                        "IPv4Address": "10.1.11.42"
-                    },
-                    "Links": null,
-                    "Aliases": [
-                        "9d9e72d885c1"
-                    ],
-                    "NetworkID": "1afb7ea28cb4a27f3176733dcfc4277cde7c0e727116b845648d8c5b817b9a9e",
-                    "EndpointID": "20ed5eb5eb65703ab427a46c49ac6469769bf75fe1da5f02c4bbb4e24300fe62",
-                    "Gateway": "10.1.11.254",
-                    "IPAddress": "10.1.11.42",
-                    "IPPrefixLen": 24,
-                    "IPv6Gateway": "",
-                    "GlobalIPv6Address": "",
-                    "GlobalIPv6PrefixLen": 0,
-                    "MacAddress": "",
-                    "DriverOpts": null
-                }
-            }
-        }
-    }
-]
-```
-:::
-
-
-察看 postfix image 裡頭的 main.cf 與 master.cf
-
-```shell=
-sudo docker exec -it postfix-41 /bin/bash
-```
-
-:::info
-cat /etc/postfix/master.cf
-
-但因為資料頗多，所以請進入詳細資訊察看唷！
-:::
-:::spoiler
-```shell=
-postfix@testpostfix:~$ sudo docker exec -it postfix-41 /bin/bash
-root@a4b34c08b51b:/tmp# cat /etc/postfix/master.cf
-#
-# Postfix master process configuration file.  For details on the format
-# of the file, see the master(5) manual page (command: "man 5 master" or
-# on-line: http://www.postfix.org/master.5.html).
-#
-# Do not forget to execute "postfix reload" after editing this file.
-#
-# ==========================================================================
-# service type  private unpriv  chroot  wakeup  maxproc command + args
-#               (yes)   (yes)   (no)    (never) (100)
-# ==========================================================================
-smtp      inet  n       -       n       -       -       smtpd
-#smtp      inet  n       -       n       -       1       postscreen
-#smtpd     pass  -       -       n       -       -       smtpd
-#dnsblog   unix  -       -       n       -       0       dnsblog
-#tlsproxy  unix  -       -       n       -       0       tlsproxy
-submission inet n       -       n       -       -       smtpd
-#  -o syslog_name=postfix/submission
-#  -o smtpd_tls_security_level=encrypt
-#  -o smtpd_sasl_auth_enable=yes
+```shell
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
 #  -o smtpd_tls_auth_only=yes
-#  -o smtpd_reject_unlisted_recipient=no
-#  -o smtpd_client_restrictions=$mua_client_restrictions
+  -o smtpd_reject_unlisted_recipient=no
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
 #  -o smtpd_helo_restrictions=$mua_helo_restrictions
 #  -o smtpd_sender_restrictions=$mua_sender_restrictions
 #  -o smtpd_recipient_restrictions=
 #  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
-#  -o milter_macro_daemon_name=ORIGINATING
-#smtps     inet  n       -       n       -       -       smtpd
-#  -o syslog_name=postfix/smtps
-#  -o smtpd_tls_wrappermode=yes
-#  -o smtpd_sasl_auth_enable=yes
-#  -o smtpd_reject_unlisted_recipient=no
-#  -o smtpd_client_restrictions=$mua_client_restrictions
+  -o milter_macro_daemon_name=ORIGINATING
+# Choose one: enable smtps for loopback clients only, or for any client.
+#127.0.0.1:smtps inet n  -       y       -       -       smtpd
+smtps     inet  n       -       y       -       -       smtpd
+  -o syslog_name=postfix/smtps
+  -o smtpd_tls_wrappermode=yes
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_reject_unlisted_recipient=no
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
 #  -o smtpd_helo_restrictions=$mua_helo_restrictions
 #  -o smtpd_sender_restrictions=$mua_sender_restrictions
 #  -o smtpd_recipient_restrictions=
 #  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
-#  -o milter_macro_daemon_name=ORIGINATING
-#628       inet  n       -       n       -       -       qmqpd
-pickup    unix  n       -       n       60      1       pickup
-cleanup   unix  n       -       n       -       0       cleanup
-qmgr      unix  n       -       n       300     1       qmgr
-#qmgr     unix  n       -       n       300     1       oqmgr
-tlsmgr    unix  -       -       n       1000?   1       tlsmgr
-rewrite   unix  -       -       n       -       -       trivial-rewrite
-bounce    unix  -       -       n       -       0       bounce
-defer     unix  -       -       n       -       0       bounce
-trace     unix  -       -       n       -       0       bounce
-verify    unix  -       -       n       -       1       verify
-flush     unix  n       -       n       1000?   0       flush
-proxymap  unix  -       -       n       -       -       proxymap
-proxywrite unix -       -       n       -       1       proxymap
-smtp      unix  -       -       n       -       -       smtp
-relay     unix  -       -       n       -       -       smtp
-        -o syslog_name=postfix/$service_name
-#       -o smtp_helo_timeout=5 -o smtp_connect_timeout=5
-showq     unix  n       -       n       -       -       showq
-error     unix  -       -       n       -       -       error
-retry     unix  -       -       n       -       -       error
-discard   unix  -       -       n       -       -       discard
-local     unix  -       n       n       -       -       local
-virtual   unix  -       n       n       -       -       virtual
-lmtp      unix  -       -       n       -       -       lmtp
-anvil     unix  -       -       n       -       1       anvil
-scache    unix  -       -       n       -       1       scache
-postlog   unix-dgram n  -       n       -       1       postlogd
-#
-# ====================================================================
-# Interfaces to non-Postfix software. Be sure to examine the manual
-# pages of the non-Postfix software to find out what options it wants.
-#
-# Many of the following services use the Postfix pipe(8) delivery
-# agent.  See the pipe(8) man page for information about ${recipient}
-# and other message envelope options.
-# ====================================================================
-#
-# maildrop. See the Postfix MAILDROP_README file for details.
-# Also specify in main.cf: maildrop_destination_recipient_limit=1
-#
-maildrop  unix  -       n       n       -       -       pipe
-  flags=DRhu user=vmail argv=/usr/bin/maildrop -d ${recipient}
-#
-# ====================================================================
-#
-# Recent Cyrus versions can use the existing "lmtp" master.cf entry.
-#
-# Specify in cyrus.conf:
-#   lmtp    cmd="lmtpd -a" listen="localhost:lmtp" proto=tcp4
-#
-# Specify in main.cf one or more of the following:
-#  mailbox_transport = lmtp:inet:localhost
-#  virtual_transport = lmtp:inet:localhost
-#
-# ====================================================================
-#
-# Cyrus 2.1.5 (Amos Gouaux)
-# Also specify in main.cf: cyrus_destination_recipient_limit=1
-#
-#cyrus     unix  -       n       n       -       -       pipe
-#  user=cyrus argv=/cyrus/bin/deliver -e -r ${sender} -m ${extension} ${user}
-#
-# ====================================================================
-# Old example of delivery via Cyrus.
-#
-#old-cyrus unix  -       n       n       -       -       pipe
-#  flags=R user=cyrus argv=/cyrus/bin/deliver -e -m ${extension} ${user}
-#
-# ====================================================================
-#
-# See the Postfix UUCP_README file for configuration details.
-#
-uucp      unix  -       n       n       -       -       pipe
-  flags=Fqhu user=uucp argv=uux -r -n -z -a$sender - $nexthop!rmail ($recipient)
-#
-# Other external delivery methods.
-#
-ifmail    unix  -       n       n       -       -       pipe
-  flags=F user=ftn argv=/usr/lib/ifmail/ifmail -r $nexthop ($recipient)
-bsmtp     unix  -       n       n       -       -       pipe
-  flags=Fq. user=bsmtp argv=/usr/lib/bsmtp/bsmtp -t$nexthop -f$sender $recipient
-scalemail-backend unix	-	n	n	-	2	pipe
-  flags=R user=scalemail argv=/usr/lib/scalemail/bin/scalemail-store ${nexthop} ${user} ${extension}
-mailman   unix  -       n       n       -       -       pipe
-  flags=FR user=list argv=/usr/lib/mailman/bin/postfix-to-mailman.py
-  ${nexthop} ${user}
-
+  -o milter_macro_daemon_name=ORIGINATING
 ```
-:::
 
+### 修改 postfix instances main.cf
+
+```shell
+# TLS
+smtpd_tls_security_level = may
+smtp_tls_security_level = may
+# smtp_tls_security_level = encrypt
+smtpd_tls_cert_file = /home/victor-postfix/ssl/2023-02-14-wildcard-ecrm-com-tw.pem
+smtpd_tls_key_file = /home/victor-postfix/ssl/2023-02-14-wildcard-ecrm-com-tw.key
+smtpd_tls_CAfile = /home/victor-postfix/ssl/alphasslrootcabundle-g4.crt
+smtpd_use_tls=yes
+smtp_tls_loglevel = 1
+smtpd_tls_loglevel = 1
+```
+
+### 展示目錄權限與檔案權限
+
+```shell
+victor-postfix@victorpostfix:~$ pwd
+/home/victor-postfix
+victor-postfix@victorpostfix:~$ ll
+total 64
+drwxr-x--- 6 victor-postfix victor-postfix 4096 Feb  1 12:21 ./
+drwxr-xr-x 3 root           root           4096 Jan  8 10:13 ../
+-rw------- 1 victor-postfix victor-postfix 2237 Feb  1 12:55 .bash_history
+-rw-r--r-- 1 victor-postfix victor-postfix  220 Jan  7  2022 .bash_logout
+-rw-r--r-- 1 victor-postfix victor-postfix 3771 Jan  7  2022 .bashrc
+drwx------ 2 victor-postfix victor-postfix 4096 Jan  8 10:14 .cache/
+-rw------- 1 victor-postfix victor-postfix   20 Feb  1 12:21 .lesshst
+drwxrwxr-x 3 victor-postfix victor-postfix 4096 Feb  1 10:39 .local/
+-rw-r--r-- 1 victor-postfix victor-postfix  807 Jan  7  2022 .profile
+-rw------- 1 victor-postfix victor-postfix  891 Jan 10 12:30 selector1-tt5
+-rw------- 1 victor-postfix victor-postfix  331 Jan 10 12:30 selector1-tt5.txt
+drwx------ 2 victor-postfix victor-postfix 4096 Jan  8 10:14 .ssh/
+drwxr-x--- 2 victor-postfix victor-postfix 4096 Jan 29 15:33 ssl/
+-rw-r--r-- 1 victor-postfix victor-postfix    0 Jan  8 10:35 .sudo_as_admin_successful
+-rw------- 1 victor-postfix victor-postfix 9684 Jan 29 15:19 .viminfo
+victor-postfix@victorpostfix:~$ ll ssl
+total 28
+drwxr-x--- 2 victor-postfix victor-postfix 4096 Jan 29 15:33 ./
+drwxr-x--- 6 victor-postfix victor-postfix 4096 Feb  1 12:21 ../
+-r-------- 1 victor-postfix victor-postfix 1675 Jan 29 15:33 2023-02-14-wildcard-ecrm-com-tw.key
+-r--r--r-- 1 victor-postfix victor-postfix 4374 Jan 29 15:33 2023-02-14-wildcard-ecrm-com-tw.pem
+-rw-r----- 1 victor-postfix victor-postfix 3485 Jan 29 15:33 2023-02-14-wildcard-ecrm-com-tw.pfx
+-r--r--r-- 1 victor-postfix victor-postfix 2942 Jan 29 15:33 alphasslrootcabundle-g4.crt
+```
+
+PS:
+pfx、pem、key、crt 等相關之間的轉換，不再贅述啦！
+
+## 附註
 :::info
-cat /etc/postfix/main.cf
-
-但因為資料頗多，所以請進入詳細資訊察看唷！
+以下附上各個設定好的檔案內容備份。
 :::
+
+### /etc/postfix/main.cf
 :::spoiler
 ```shell=
-root@a4b34c08b51b:/tmp# cat /etc/postfix/main.cf
+victor-postfix@victorpostfix:~$ cat /etc/postfix/main.cf
 # See /usr/share/postfix/main.cf.dist for a commented, more complete version
 
 
@@ -884,8 +563,10 @@ root@a4b34c08b51b:/tmp# cat /etc/postfix/main.cf
 # is /etc/mailname.
 #myorigin = /etc/mailname
 
-smtpd_banner = $myhostname ESMTP $mail_name (Debian/GNU)
+smtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)
 biff = no
+
+mail_name = WebMAX
 
 # appending .domain is the MUA's job.
 append_dot_mydomain = no
@@ -907,47 +588,487 @@ smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
 smtpd_tls_security_level=may
 
 smtp_tls_CApath=/etc/ssl/certs
-smtp_tls_security_level = may
-smtp_tls_session_cache_database = lmdb:${data_directory}/smtp_scache
+smtp_tls_security_level=may
+smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
 
 
 smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination
-#myhostname = localhost.j2xen23xrnaetdgy434mngmvif.cx.internal.cloudapp.net
-alias_maps = lmdb:/etc/aliases
-alias_database = lmdb:/etc/aliases
-mydestination =
-#relayhost =
-mynetworks = 127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+myhostname = postfix-main-server.ecrm.com.tw
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+myorigin = /etc/mailname
+mydestination = $myhostname, victorpostfix.com, victorpostfix, localhost.localdomain, localhost
+relayhost =
+# mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+mynetworks_style = subnet
+mynetworks = 10.0.0.0/16, 10.1.0.0/16
+
 mailbox_size_limit = 0
 recipient_delimiter = +
-inet_interfaces = all
+inet_interfaces = localhost
 inet_protocols = all
-manpage_directory = /usr/share/man
-default_database_type = lmdb
-relay_domains =
-header_size_limit = 4096000
-smtpd_delay_reject = yes
-smtpd_helo_required = yes
-smtpd_client_restrictions = permit_mynetworks,reject
-smtpd_helo_restrictions = permit_mynetworks,reject_invalid_helo_hostname,permit
-smtpd_sender_restrictions = permit_mynetworks,reject
-smtp_sasl_mechanism_filter = scram,scram,scram,scram,scram,digestmd5,crammd5,ntlm,login,plain,anonymous
-message_size_limit = 0
-myhostname = a4b34c08b51b
+
+multi_instance_enable = yes
+multi_instance_wrapper = ${command_directory}/postmulti -p --
+multi_instance_directories = /etc/postfix-43 /etc/postfix-45 /etc/postfix-46
+
+debug_peer_level = 2
 ```
 :::
 
-查看 netstat -ntulp
-
+### /etc/postfix/master.cf
+:::spoiler
 ```shell=
-root@a4b34c08b51b:/tmp# netstat -ntulp
-Active Internet connections (only servers)
-Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name
-tcp        0      0 127.0.0.11:40865        0.0.0.0:*               LISTEN      -
-tcp        0      0 0.0.0.0:25              0.0.0.0:*               LISTEN      -
-tcp        0      0 0.0.0.0:587             0.0.0.0:*               LISTEN      -
-tcp6       0      0 :::25                   :::*                    LISTEN      -
-tcp6       0      0 :::587                  :::*                    LISTEN      -
-udp        0      0 127.0.0.11:53203        0.0.0.0:*                           -
+victor-postfix@victorpostfix:~$ cat /etc/postfix/master.cf
+#
+# Postfix master process configuration file.  For details on the format
+# of the file, see the master(5) manual page (command: "man 5 master" or
+# on-line: http://www.postfix.org/master.5.html).
+#
+# Do not forget to execute "postfix reload" after editing this file.
+#
+# ==========================================================================
+# service type  private unpriv  chroot  wakeup  maxproc command + args
+#               (yes)   (yes)   (no)    (never) (100)
+# ==========================================================================
+smtp      inet  n       -       y       -       -       smtpd
+#smtp      inet  n       -       y       -       1       postscreen
+#smtpd     pass  -       -       y       -       -       smtpd
+#dnsblog   unix  -       -       y       -       0       dnsblog
+#tlsproxy  unix  -       -       y       -       0       tlsproxy
+# Choose one: enable submission for loopback clients only, or for any client.
+#127.0.0.1:submission inet n -   y       -       -       smtpd
+#submission inet n       -       y       -       -       smtpd
+#  -o syslog_name=postfix/submission
+#  -o smtpd_tls_security_level=encrypt
+#  -o smtpd_sasl_auth_enable=yes
+#  -o smtpd_tls_auth_only=yes
+#  -o smtpd_reject_unlisted_recipient=no
+#  -o smtpd_client_restrictions=$mua_client_restrictions
+#  -o smtpd_helo_restrictions=$mua_helo_restrictions
+#  -o smtpd_sender_restrictions=$mua_sender_restrictions
+#  -o smtpd_recipient_restrictions=
+#  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+#  -o milter_macro_daemon_name=ORIGINATING
+# Choose one: enable smtps for loopback clients only, or for any client.
+#127.0.0.1:smtps inet n  -       y       -       -       smtpd
+#smtps     inet  n       -       y       -       -       smtpd
+#  -o syslog_name=postfix/smtps
+#  -o smtpd_tls_wrappermode=yes
+#  -o smtpd_sasl_auth_enable=yes
+#  -o smtpd_reject_unlisted_recipient=no
+#  -o smtpd_client_restrictions=$mua_client_restrictions
+#  -o smtpd_helo_restrictions=$mua_helo_restrictions
+#  -o smtpd_sender_restrictions=$mua_sender_restrictions
+#  -o smtpd_recipient_restrictions=
+#  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+#  -o milter_macro_daemon_name=ORIGINATING
+#628       inet  n       -       y       -       -       qmqpd
+pickup    unix  n       -       y       60      1       pickup
+cleanup   unix  n       -       y       -       0       cleanup
+qmgr      unix  n       -       n       300     1       qmgr
+#qmgr     unix  n       -       n       300     1       oqmgr
+tlsmgr    unix  -       -       y       1000?   1       tlsmgr
+rewrite   unix  -       -       y       -       -       trivial-rewrite
+bounce    unix  -       -       y       -       0       bounce
+defer     unix  -       -       y       -       0       bounce
+trace     unix  -       -       y       -       0       bounce
+verify    unix  -       -       y       -       1       verify
+flush     unix  n       -       y       1000?   0       flush
+proxymap  unix  -       -       n       -       -       proxymap
+proxywrite unix -       -       n       -       1       proxymap
+smtp      unix  -       -       y       -       -       smtp
+relay     unix  -       -       y       -       -       smtp
+        -o syslog_name=postfix/$service_name
+#       -o smtp_helo_timeout=5 -o smtp_connect_timeout=5
+showq     unix  n       -       y       -       -       showq
+error     unix  -       -       y       -       -       error
+retry     unix  -       -       y       -       -       error
+discard   unix  -       -       y       -       -       discard
+local     unix  -       n       n       -       -       local
+virtual   unix  -       n       n       -       -       virtual
+lmtp      unix  -       -       y       -       -       lmtp
+anvil     unix  -       -       y       -       1       anvil
+scache    unix  -       -       y       -       1       scache
+postlog   unix-dgram n  -       n       -       1       postlogd
+#
+# ====================================================================
+# Interfaces to non-Postfix software. Be sure to examine the manual
+# pages of the non-Postfix software to find out what options it wants.
+#
+# Many of the following services use the Postfix pipe(8) delivery
+# agent.  See the pipe(8) man page for information about ${recipient}
+# and other message envelope options.
+# ====================================================================
+#
+# maildrop. See the Postfix MAILDROP_README file for details.
+# Also specify in main.cf: maildrop_destination_recipient_limit=1
+#
+maildrop  unix  -       n       n       -       -       pipe
+  flags=DRXhu user=vmail argv=/usr/bin/maildrop -d ${recipient}
+#
+# ====================================================================
+#
+# Recent Cyrus versions can use the existing "lmtp" master.cf entry.
+#
+# Specify in cyrus.conf:
+#   lmtp    cmd="lmtpd -a" listen="localhost:lmtp" proto=tcp4
+#
+# Specify in main.cf one or more of the following:
+#  mailbox_transport = lmtp:inet:localhost
+#  virtual_transport = lmtp:inet:localhost
+#
+# ====================================================================
+#
+# Cyrus 2.1.5 (Amos Gouaux)
+# Also specify in main.cf: cyrus_destination_recipient_limit=1
+#
+#cyrus     unix  -       n       n       -       -       pipe
+#  flags=DRX user=cyrus argv=/cyrus/bin/deliver -e -r ${sender} -m ${extension} ${user}
+#
+# ====================================================================
+# Old example of delivery via Cyrus.
+#
+#old-cyrus unix  -       n       n       -       -       pipe
+#  flags=R user=cyrus argv=/cyrus/bin/deliver -e -m ${extension} ${user}
+#
+# ====================================================================
+#
+# See the Postfix UUCP_README file for configuration details.
+#
+uucp      unix  -       n       n       -       -       pipe
+  flags=Fqhu user=uucp argv=uux -r -n -z -a$sender - $nexthop!rmail ($recipient)
+#
+# Other external delivery methods.
+#
+ifmail    unix  -       n       n       -       -       pipe
+  flags=F user=ftn argv=/usr/lib/ifmail/ifmail -r $nexthop ($recipient)
+bsmtp     unix  -       n       n       -       -       pipe
+  flags=Fq. user=bsmtp argv=/usr/lib/bsmtp/bsmtp -t$nexthop -f$sender $recipient
+scalemail-backend unix -       n       n       -       2       pipe
+  flags=R user=scalemail argv=/usr/lib/scalemail/bin/scalemail-store ${nexthop} ${user} ${extension}
+mailman   unix  -       n       n       -       -       pipe
+  flags=FRX user=list argv=/usr/lib/mailman/bin/postfix-to-mailman.py ${nexthop} ${user}
 ```
+:::
 
+
+### /etc/postfix-43/main.cf
+:::spoiler
+```shell=
+victor-postfix@victorpostfix:~$ cat /etc/postfix-43/main.cf |grep -v '#'
+
+compatibility_level = 3.6
+
+data_directory = /var/lib/postfix-43
+
+myhostname = s43.11.ecrm.com.tw
+mydomain = $myhostname
+
+unknown_local_recipient_reject_code = 550
+
+mynetworks_style = subnet
+
+mynetworks = 10.0.0.0/16, 10.1.0.0/16
+
+alias_maps = hash:/etc/aliases
+
+alias_database = hash:/etc/aliases
+
+smtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)
+
+debug_peer_level = 2
+
+
+debugger_command =
+	 PATH=/bin:/usr/bin:/usr/local/bin:/usr/X11R6/bin
+	 ddd $daemon_directory/$process_name $process_id & sleep 5
+
+readme_directory = no
+maximal_queue_lifetime = 6h
+mail_name = WebMAX
+smtp_destination_concurrency_limit = 2
+bounce_size_limit = 10000000
+maximal_backoff_time = 900
+inet_protocols = ipv4
+authorized_submit_users =
+queue_directory = /var/spool/postfix-43
+multi_instance_name = postfix-43
+multi_instance_group = mail
+
+inet_interfaces = 10.1.11.43
+multi_instance_enable = yes
+
+smtpd_milters           = inet:127.0.0.1:8891
+non_smtpd_milters       = $smtpd_milters
+milter_default_action   = accept
+milter_protocol         = 2
+
+smtpd_tls_security_level = may
+smtp_tls_security_level = may
+smtpd_tls_cert_file = /home/victor-postfix/ssl/2023-02-14-wildcard-ecrm-com-tw.pem
+smtpd_tls_key_file = /home/victor-postfix/ssl/2023-02-14-wildcard-ecrm-com-tw.key
+smtpd_tls_CAfile = /home/victor-postfix/ssl/alphasslrootcabundle-g4.crt
+smtpd_use_tls=yes
+smtp_tls_loglevel = 1
+smtpd_tls_loglevel = 1
+```
+:::
+
+
+### /etc/postfix-43/master.cf
+:::spoiler
+```shell=
+victor-postfix@victorpostfix:~$ cat /etc/postfix-43/master.cf
+#
+# Postfix master process configuration file.  For details on the format
+# of the file, see the master(5) manual page (command: "man 5 master" or
+# on-line: http://www.postfix.org/master.5.html).
+#
+# Do not forget to execute "postfix reload" after editing this file.
+#
+# ==========================================================================
+# service type  private unpriv  chroot  wakeup  maxproc command + args
+#               (yes)   (yes)   (no)    (never) (100)
+# ==========================================================================
+smtp      inet  n       -       y       -       -       smtpd
+#smtp      inet  n       -       y       -       1       postscreen
+#smtpd     pass  -       -       y       -       -       smtpd
+#dnsblog   unix  -       -       y       -       0       dnsblog
+#tlsproxy  unix  -       -       y       -       0       tlsproxy
+# Choose one: enable submission for loopback clients only, or for any client.
+#127.0.0.1:submission inet n -   y       -       -       smtpd
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+#  -o smtpd_tls_auth_only=yes
+  -o smtpd_reject_unlisted_recipient=no
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+#  -o smtpd_helo_restrictions=$mua_helo_restrictions
+#  -o smtpd_sender_restrictions=$mua_sender_restrictions
+#  -o smtpd_recipient_restrictions=
+#  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
+# Choose one: enable smtps for loopback clients only, or for any client.
+#127.0.0.1:smtps inet n  -       y       -       -       smtpd
+smtps     inet  n       -       y       -       -       smtpd
+  -o syslog_name=postfix/smtps
+  -o smtpd_tls_wrappermode=yes
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_reject_unlisted_recipient=no
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+#  -o smtpd_helo_restrictions=$mua_helo_restrictions
+#  -o smtpd_sender_restrictions=$mua_sender_restrictions
+#  -o smtpd_recipient_restrictions=
+#  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
+#628       inet  n       -       y       -       -       qmqpd
+pickup    unix  n       -       y       60      1       pickup
+cleanup   unix  n       -       y       -       0       cleanup
+qmgr      unix  n       -       n       300     1       qmgr
+#qmgr     unix  n       -       n       300     1       oqmgr
+tlsmgr    unix  -       -       y       1000?   1       tlsmgr
+rewrite   unix  -       -       y       -       -       trivial-rewrite
+bounce    unix  -       -       y       -       0       bounce
+defer     unix  -       -       y       -       0       bounce
+trace     unix  -       -       y       -       0       bounce
+verify    unix  -       -       y       -       1       verify
+flush     unix  n       -       y       1000?   0       flush
+proxymap  unix  -       -       n       -       -       proxymap
+proxywrite unix -       -       n       -       1       proxymap
+smtp      unix  -       -       y       -       -       smtp
+relay     unix  -       -       y       -       -       smtp
+        -o syslog_name=postfix/$service_name
+#       -o smtp_helo_timeout=5 -o smtp_connect_timeout=5
+showq     unix  n       -       y       -       -       showq
+error     unix  -       -       y       -       -       error
+retry     unix  -       -       y       -       -       error
+discard   unix  -       -       y       -       -       discard
+local     unix  -       n       n       -       -       local
+virtual   unix  -       n       n       -       -       virtual
+lmtp      unix  -       -       y       -       -       lmtp
+anvil     unix  -       -       y       -       1       anvil
+scache    unix  -       -       y       -       1       scache
+postlog   unix-dgram n  -       n       -       1       postlogd
+#
+# ====================================================================
+# Interfaces to non-Postfix software. Be sure to examine the manual
+# pages of the non-Postfix software to find out what options it wants.
+#
+# Many of the following services use the Postfix pipe(8) delivery
+# agent.  See the pipe(8) man page for information about ${recipient}
+# and other message envelope options.
+# ====================================================================
+#
+# maildrop. See the Postfix MAILDROP_README file for details.
+# Also specify in main.cf: maildrop_destination_recipient_limit=1
+#
+maildrop  unix  -       n       n       -       -       pipe
+  flags=DRXhu user=vmail argv=/usr/bin/maildrop -d ${recipient}
+#
+# ====================================================================
+#
+# Recent Cyrus versions can use the existing "lmtp" master.cf entry.
+#
+# Specify in cyrus.conf:
+#   lmtp    cmd="lmtpd -a" listen="localhost:lmtp" proto=tcp4
+#
+# Specify in main.cf one or more of the following:
+#  mailbox_transport = lmtp:inet:localhost
+#  virtual_transport = lmtp:inet:localhost
+#
+# ====================================================================
+#
+# Cyrus 2.1.5 (Amos Gouaux)
+# Also specify in main.cf: cyrus_destination_recipient_limit=1
+#
+#cyrus     unix  -       n       n       -       -       pipe
+#  flags=DRX user=cyrus argv=/cyrus/bin/deliver -e -r ${sender} -m ${extension} ${user}
+#
+# ====================================================================
+# Old example of delivery via Cyrus.
+#
+#old-cyrus unix  -       n       n       -       -       pipe
+#  flags=R user=cyrus argv=/cyrus/bin/deliver -e -m ${extension} ${user}
+#
+# ====================================================================
+#
+# See the Postfix UUCP_README file for configuration details.
+#
+uucp      unix  -       n       n       -       -       pipe
+  flags=Fqhu user=uucp argv=uux -r -n -z -a$sender - $nexthop!rmail ($recipient)
+#
+# Other external delivery methods.
+#
+ifmail    unix  -       n       n       -       -       pipe
+  flags=F user=ftn argv=/usr/lib/ifmail/ifmail -r $nexthop ($recipient)
+bsmtp     unix  -       n       n       -       -       pipe
+  flags=Fq. user=bsmtp argv=/usr/lib/bsmtp/bsmtp -t$nexthop -f$sender $recipient
+scalemail-backend unix -       n       n       -       2       pipe
+  flags=R user=scalemail argv=/usr/lib/scalemail/bin/scalemail-store ${nexthop} ${user} ${extension}
+mailman   unix  -       n       n       -       -       pipe
+  flags=FRX user=list argv=/usr/lib/mailman/bin/postfix-to-mailman.py ${nexthop} ${user}
+```
+:::
+
+### /etc/opendkim.conf
+:::spoiler
+```shell=
+victor-postfix@victorpostfix:~$ cat /etc/opendkim.conf
+# This is a basic configuration for signing and verifying. It can easily be
+# adapted to suit a basic installation. See opendkim.conf(5) and
+# /usr/share/doc/opendkim/examples/opendkim.conf.sample for complete
+# documentation of available configuration parameters.
+
+Syslog			yes
+SyslogSuccess		yes
+#LogWhy			no
+
+# Common signing and verification parameters. In Debian, the "From" header is
+# oversigned, because it is often the identity key used by reputation systems
+# and thus somewhat security sensitive.
+Canonicalization	relaxed/simple
+#Mode			sv
+#SubDomains		no
+OversignHeaders		From
+
+# Signing domain, selector, and key (required). For example, perform signing
+# for domain "example.com" with selector "2020" (2020._domainkey.example.com),
+# using the private key stored in /etc/dkimkeys/example.private. More granular
+# setup options can be found in /usr/share/doc/opendkim/README.opendkim.
+#Domain			example.com
+#Selector		2020
+#KeyFile		/etc/dkimkeys/example.private
+
+Domain	*
+
+KeyFile /etc/opendkim/keys/default.private
+
+Selector default
+
+KeyTable /etc/opendkim/KeyTable
+
+
+SigningTable /etc/opendkim/SigningTable
+# In Debian, opendkim runs as user "opendkim". A umask of 007 is required when
+# using a local socket with MTAs that access the socket as a non-privileged
+# user (for example, Postfix). You may need to add user "postfix" to group
+# "opendkim" in that case.
+UserID			opendkim
+UMask			007
+
+# Socket for the MTA connection (required). If the MTA is inside a chroot jail,
+# it must be ensured that the socket is accessible. In Debian, Postfix runs in
+# a chroot in /var/spool/postfix, therefore a Unix socket would have to be
+# configured as shown on the last line below.
+#Socket			local:/run/opendkim/opendkim.sock
+Socket			inet:8891@localhost
+#Socket			inet:8891
+#Socket			local:/var/spool/postfix/opendkim/opendkim.sock
+
+#PidFile			/run/opendkim/opendkim.pid
+
+# Hosts for which to sign rather than verify, default is 127.0.0.1. See the
+# OPERATION section of opendkim(8) for more information.
+InternalHosts		10.1.0.0/16, 10.0.0.0/16
+
+# The trust anchor enables DNSSEC. In Debian, the trust anchor file is provided
+# by the package dns-root-data.
+TrustAnchorFile		/usr/share/dns/root.key
+#Nameservers		127.0.0.1
+```
+:::
+
+### /etc/opendkim/KeyTable
+:::spoiler
+```shell=
+victor-postfix@victorpostfix:/etc/opendkim$ sudo cat KeyTable
+[sudo] password for victor-postfix:
+# OPENDKIM KEY TABLE
+# To use this file, uncomment the #KeyTable option in /etc/opendkim.conf,
+# then uncomment the following line and replace example.com with your domain
+# name, then restart OpenDKIM. Additional keys may be added on separate lines.
+
+#default._domainkey.example.com example.com:default:/etc/opendkim/keys/default.private
+#selector1-tt3._domainkey.tt3.ecrm.com.tw tt3.ecrm.com.tw:selector1-tt3:/etc/opendkim/keys/tt3.ecrm.com.tw/selector1-tt3
+#
+selector1-tt5._domainkey.tt5.ecrm.com.tw tt5.ecrm.com.tw:selector1-tt5:/etc/opendkim/keys/tt5.ecrm.com.tw/selector1-tt5
+```
+:::
+
+### /etc/opendkim/SigningTable
+:::spoiler
+```shell=
+victor-postfix@victorpostfix:/etc/opendkim$ sudo cat SigningTable
+# OPENDKIM SIGNING TABLE
+# This table controls how to apply one or more signatures to outgoing messages based
+# on the address found in the From: header field. In simple terms, this tells
+# OpenDKIM "how" to apply your keys.
+
+# To use this file, uncomment the SigningTable option in /etc/opendkim.conf,
+# then uncomment one of the usage examples below and replace example.com with your
+# domain name, then restart OpenDKIM.
+
+# WILDCARD EXAMPLE
+# Enables signing for any address on the listed domain(s), but will work only if
+# "refile:/etc/opendkim/SigningTable" is included in /etc/opendkim.conf.
+# Create additional lines for additional domains.
+
+#*@example.com default._domainkey.example.com
+
+# NON-WILDCARD EXAMPLE
+# If "file:" (instead of "refile:") is specified in /etc/opendkim.conf, then
+# wildcards will not work. Instead, full user@host is checked first, then simply host,
+# then user@.domain (with all superdomains checked in sequence, so "foo.example.com"
+# would first check "user@foo.example.com", then "user@.example.com", then "user@.com"),
+# then .domain, then user@*, and finally *. See the opendkim.conf(5) man page under
+# "SigningTable" for more details.
+
+#example.com default._domainkey.example.com
+# *@tt3.ecrm.com.tw selector1-tt3._domainkey.tt3.ecrm.com.tw
+
+*@tt5.ecrm.com.tw selector1-tt5._domainkey.tt5.ecrm.com.tw
+```
+:::
+![image](https://hackmd.io/_uploads/SkPcUTu5p.jpg)
